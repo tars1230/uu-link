@@ -3,7 +3,7 @@ name: uu-link
 description: 通过网易 UU 远程自带的端口映射，建立到任意一台 UU 账号设备的 SSH 通路，含自动建会话、通路健康判定与排障。This skill should be used when the user asks to 连接/操控另一台电脑、建跨机通道、去另一台机器取文件或跑命令，或提到 uulink、UU 端口映射、办公室电脑、家里的电脑。
 description_zh: "用 UU 远程端口映射一键建立跨机 SSH 通路；用户提到 uulink、UU 端口映射、连办公室/家里的电脑时使用"
 description_en: "One-command SSH channel to any device on your UU Remote account; use when asked to reach another machine via UU port mapping"
-version: 1.0.3
+version: 1.0.4
 agent_created: true
 allowed-tools: Bash,Read
 metadata:
@@ -112,14 +112,43 @@ uulink down             # 解释为什么"关掉单向连接"不该做（不执�
 
 `up` 结束会自动关掉它自己拉起的 `sessionN` 终端窗口——**只是清理窗口，映射挂在会话上，不受影响**。
 
-## 反方向（A ⇄ B）怎么建
-
-同前：映射配在发起方、只能 GUI 加。每对设备首次都要配一次，「两边都装了」不等于「能连」。
+### 判断「被控端到底有没有开 SSH」，不要用 `lsof`
 
 ```bash
-# Windows 端加完映射后（端口与用户名按你自己的来，别照抄）
-ssh -p <本地端口> -i <私钥路径> <用户名>@127.0.0.1
+lsof -nP -iTCP:22 -sTCP:LISTEN    # 普通用户跑，常常是空的
 ```
+
+**空 ≠ 没开**：`sshd` 是 root 进程，普通用户的 `lsof` 看不见它的 socket。判据只有读 banner：
+
+```bash
+python3 -c "import socket;s=socket.create_connection(('127.0.0.1',22),timeout=5);print(s.recv(64))"
+```
+
+这条坑在本项目里骗过两次（公网中间盒一次、把"看不见"当"没有"一次）。**凡是"看不到"就下结论之前，先换一个能读到真实反馈的手段。**
+
+## 反方向（A ⇄ B）怎么建
+
+两条路，**优先第二条**：
+
+**① 在发起方 UU 里加映射**（必须 GUI、每对设备配一次，Windows 端尤其麻烦）
+
+**② 借道已有正向通道做反向转发——不用碰 UU、不用在被控端装任何东西**
+
+```bash
+# 在 A（已经能 ssh 到 B 的那台）执行：把 B 的 2223 转回 A 的 22
+ssh -fN -o ExitOnForwardFailure=yes -R 2223:127.0.0.1:22 <B 的别名>
+
+# 在 B 上验证（读到 banner 才算通，不要只看端口在）
+ssh -p 2223 <A 的用户名>@127.0.0.1
+```
+
+代价：A 上那条 `ssh -fN` 必须活着（A 关机/进程被杀 = 通路没了）。需要长活就挂 launchd。
+
+### Windows 端做这些的三个语法坑
+
+- `%TEMP%` 在 PowerShell 不展开 → 用 `$env:TEMP` 或 `cmd /c "…"`
+- PowerShell 5.1 不支持 `&&` → 拆成两条
+- `ssh-keygen -N ""` 经 PowerShell 会被吞 → 用 `cmd.exe /c 'ssh-keygen … -N "" …'`；否则**静默失败，你还会以为密钥生成了**
 
 ## 平台边界
 

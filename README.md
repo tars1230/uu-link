@@ -85,6 +85,53 @@ uulink ssh office-pc 'hostname; whoami'
 | 设备离线 | 目标机 UU 没开/没登录 | 到那台机器把 UU 开起来 |
 | 每条命令 1.4–1.8 s | Windows 每条新起 PowerShell | 正常；进交互会话后就不重启 shell 了 |
 
+## 装完连不上？按这个顺序查
+
+这一节是**别人装的时候真的卡住过的地方**，不是理论清单。
+
+**① 先确认「被控端」到底有没有开 SSH —— 但别用 `lsof` 判断**
+
+```bash
+lsof -nP -iTCP:22 -sTCP:LISTEN     # 普通用户跑，常常什么都不输出
+```
+
+**空输出 ≠ 没开。** `sshd` 是 root 进程，普通用户的 `lsof` 看不到它的 socket。正确判据是读 banner：
+
+```bash
+python3 -c "import socket;s=socket.create_connection(('127.0.0.1',22),timeout=5);print(s.recv(64))"
+# b'SSH-2.0-OpenSSH_10.3\r\n'  ← 这才是"开着"
+```
+
+这条坑在本项目里骗过两次：一次是公网 IP 的中间盒，一次是把"看不见"当成"没有"。
+
+**② Windows 端装不了 `uulink` —— 别试了**
+
+`uulink` 是 bash 脚本，还依赖 `uuyc-cli`。而 **Windows 版 UU 根本不带 `uuyc-cli`**。Windows 端只有两条路：图形界面加映射 + 手敲 `ssh -p 2222 user@127.0.0.1`，或者干脆用下面的 ③。
+
+**③ 反向通道（公司 → 家里）不用配 UU 映射，借道就行**
+
+如果 A → B 已经通了，要在 B 上反向访问 A，**不需要动 B 的 UU**，在 A 上起一条反向转发即可：
+
+```bash
+# 在 A（家里那台）执行：把 B 的 2223 转回本机 22
+ssh -fN -o ExitOnForwardFailure=yes -R 2223:127.0.0.1:22 <B 的 ssh 别名>
+
+# 在 B（公司那台）验证，能看到对端 banner 才算通
+ssh -p 2223 <A 的用户名>@127.0.0.1
+```
+
+好处：B 上什么都不用装、不用配、不用点图形界面。代价：A 上那条 `ssh -fN` 得活着（A 关机或进程被杀，通路就没了）。
+
+**④ Windows 上做这些事，三个引号/语法坑**
+
+- **`%TEMP%` 在 PowerShell 里不展开**：`ssh host 'type %TEMP%\x'` 会被当成字面路径 → `PathNotFound`，看着像"文件没传上去"。要写 `$env:TEMP`，或 `cmd /c "type %TEMP%\x"`。
+- **PowerShell 5.1 不支持 `&&`**：`cmd /c a && b` 会 `ParserError`。拆成两条，或 `; if ($?) { b }`。
+- **给 `ssh-keygen` 传空 passphrase**：`-N ""` 经 PowerShell 会被吞掉。用 `cmd.exe /c 'ssh-keygen ... -N "" ...'`（单引号原样传给 cmd），否则命令静默失败、你还会以为密钥生成了。
+
+**⑤ 别在一条通道上并发做重活**
+
+同一时刻跑着 `ssh -fN` 隧道、另一个 `uulink ssh`、再来个 `scp`，可能拿到 `Connection closed by 127.0.0.1 port 2222`。不是通道坏了——串行做就好。
+
 ## 边界
 
 - **只有 macOS 客户端。** Windows 版 UU 不带 CLI，Windows 端请用图形界面按「首次配置」加映射，然后直接 `ssh -p 2222 administrator@127.0.0.1`
