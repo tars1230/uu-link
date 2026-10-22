@@ -244,7 +244,7 @@ print("  版本 %s  登录 %s  网络 %s" % (d.get("appVersion"), d.get("isLogge
       [ "${fails:-0}" -gt 0 ] 2>/dev/null && warn "  $name 连续失败 ${fails} 次（看护在退避重试）"
     done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
   elif [ -f "$WATCH_PLIST" ]; then
-    info "看护：plist 已装但还没跑过（launchctl list | grep $WATCH_LABEL）"
+    info "看护：plist 已装但还没跑过（launchctl list | grep ${WATCH_LABEL}）"
   else
     info "看护未启用：uulink watch --install（每分钟 banner 检测，断了自动修）"
   fi
