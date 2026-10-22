@@ -236,7 +236,7 @@ print("  版本 %s  登录 %s  网络 %s" % (d.get("appVersion"), d.get("isLogge
   [ $found -eq 1 ] || info "还没配设备：编辑 ${CFG}（模板里有格式），或先 uulink list 看设备名"
   local lr fails loaded=0
   launchctl list "$WATCH_LABEL" >/dev/null 2>&1 && loaded=1
-  lr=$(awk -F'\t' '$1=="_run"{print $2; exit}' "$STATE" 2>/dev/null)
+  lr=$(cat "$LASTF" 2>/dev/null)
   if [ $loaded -eq 1 ] && [ -n "${lr:-}" ]; then
     info "看护：上次运行 $(date -r "$lr" '+%m-%d %H:%M:%S' 2>/dev/null || echo "$lr")（日志 ${WLOG}）"
     while IFS=$'\t' read -r name _ port _ _; do
@@ -405,7 +405,8 @@ cmd_ssh() {
 STATE="$HOME/.config/uulink/watch.state"    # 每行：名称<TAB>连续失败数<TAB>上次尝试epoch
 WLOG="$HOME/.config/uulink/watch.log"       # 人读的流水账
 TUNNELS="$HOME/.config/uulink/tunnels.tsv"  # 每行：设备名<TAB>launchd标签
-LOCK="$HOME/.config/uulink/watch.lock"
+LOCKD="$HOME/.config/uulink/watch.lock"      # 目录锁（mkdir 原子），见 acquire_lock
+LASTF="$HOME/.config/uulink/watch.last"      # 最近一次运行时刻；单独存，避免和设备名撞键
 WATCH_PLIST="$HOME/Library/LaunchAgents/com.uulink.watch.plist"
 WATCH_LABEL="com.uulink.watch"
 
@@ -428,15 +429,49 @@ watch_put() { # $1=名称 $2=fails $3=last_attempt
     && mv -f "$tmp" "$STATE"
 }
 
-lock_alive() { # 锁目录里的 pid 是否还是个活进程
-  local p
-  [ -f "$LOCK/pid" ] || return 1
-  p=$(cat "$LOCK/pid" 2>/dev/null)
-  case "${p:-}" in ''|*[!0-9]*) return 1 ;; esac
-  ps -p "$p" >/dev/null 2>&1
+# 锁只用 mkdir：它是内核保证原子的，不需要"创建 + 写内容"两步。
+# 关键取舍：**判据只看目录年龄，不判进程活没活**。
+#   · 不判 pid 存活 → 彻底没有 PID 被复用后"锁永远被占、看护静默停摆"这个失效模式
+#   · 代价是崩溃留下的锁要等 LOCK_STALE 才回收（由定时器兜底，可接受）
+#   · 目录里的 pid 文件只给人看，任何决策都不读它
+LOCK_STALE=600    # 秒。一轮最长约 90s，留足余量
+
+lock_age() {
+  local m
+  m=$(stat -f %m "$LOCKD" 2>/dev/null) || return 1
+  printf '%s' $(( $(date +%s) - m ))
 }
 
-WERR="$HOME/.config/uulink/watch.err"
+acquire_lock() {
+  if mkdir "$LOCKD" 2>/dev/null; then
+    printf '%s\n' $$ >"$LOCKD/pid"
+    return 0
+  fi
+  local age
+  if ! age=$(lock_age); then          # 目录刚消失（上一轮恰好结束），直接重抢
+    mkdir "$LOCKD" 2>/dev/null || return 1
+    printf '%s\n' $$ >"$LOCKD/pid"
+    return 0
+  fi
+  [ "$age" -gt "$LOCK_STALE" ] || return 1    # 还新鲜，当别人在用
+  # 回收陈旧锁。mv 走之后再核一次年龄：万一搬到的其实是别人刚建的新锁，
+  # 年龄对不上就原样放回去（这一步把"两个回收者互删"的窗口也堵了）
+  local aside="$LOCKD.stale.$$" m2
+  mv "$LOCKD" "$aside" 2>/dev/null || return 1
+  m2=$(stat -f %m "$aside" 2>/dev/null || echo "$(date +%s)")
+  if [ $(( $(date +%s) - m2 )) -gt "$LOCK_STALE" ]; then
+    rm -rf "$aside"
+  else
+    mv "$aside" "$LOCKD" 2>/dev/null
+    return 1
+  fi
+  mkdir "$LOCKD" 2>/dev/null || return 1
+  printf '%s\n' $$ >"$LOCKD/pid"
+  return 0
+}
+
+# 动真格之前确认锁还是自己的（内容比对），防止极端并发下两轮同时自愈
+lock_still_mine() { [ "$(cat "$LOCKD/pid" 2>/dev/null)" = "$$" ]; }
 
 wlog() {
   mkdir -p "$(dirname "$WLOG")"
@@ -501,23 +536,14 @@ cmd_watch() {
   [ -t 1 ] || NO_OSA=1
 
   # 单实例：上一轮还没跑完就跳过，避免两轮同时补救打架
-  if ! mkdir "$LOCK" 2>/dev/null; then
-    if lock_alive; then
-      [ $quiet -eq 0 ] && info "上一轮看护还在跑，本轮跳过"
-      return 0
-    fi
-    # 另一个实例可能刚 mkdir 完、还没写 pid（这个窗口里不能直接抢锁，
-    # 否则会把它的活锁删掉，导致两轮同时在补救）
-    [ -f "$LOCK/pid" ] || sleep 1
-    if lock_alive; then
-      [ $quiet -eq 0 ] && info "上一轮看护还在跑，本轮跳过"
-      return 0
-    fi
-    rm -rf "$LOCK"
-    mkdir "$LOCK" 2>/dev/null || return 0
+  if ! acquire_lock; then
+    [ $quiet -eq 0 ] && info "上一轮看护还在跑，本轮跳过"
+    return 0
   fi
-  echo $$ >"$LOCK/pid"
-  trap 'rm -rf "$LOCK"' EXIT INT TERM
+  # 信号只负责"退出"，清理交给 EXIT：否则 INT/TERM 后进程会带着失效的锁继续跑
+  trap 'rm -rf "$LOCKD"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   while :; do
     rc=0
@@ -572,6 +598,13 @@ cmd_watch() {
         wlog "$name :$port 不通，且 uu device list 无输出（CLI 异常）→ 仍尝试自愈"
       fi
 
+      # 动手前再确认一次锁还是自己的：万一被抢走，宁可本轮什么都不做
+      if ! lock_still_mine; then
+        wlog "$name :$port 待自愈，但锁已易主（检测到并发实例）→ 本轮放弃"
+        [ $quiet -eq 0 ] && warn "锁已易主，本轮放弃自愈"
+        continue
+      fi
+
       # 先拿 id 再动手：拿不到就别踢隧道（否则隧道被重启、自愈却根本没执行）
       id=$(printf '%s\n' "${devlist:-}" | awk -F'\t' -v w="$name" 'tolower($1)==tolower(w){print $2; exit}')
       if [ -z "${id:-}" ]; then
@@ -597,9 +630,10 @@ cmd_watch() {
       fi
     done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
 
-    watch_put _run "$now" "$now"
+    mkdir -p "$(dirname "$LASTF")" && printf '%s\n' "$now" >"$LASTF" 2>/dev/null
     [ $once -eq 1 ] && break
-    sleep 60
+    # 用 sleep & wait：前台 sleep 期间 bash 不执行 trap，TERM 会拖到 sleep 结束
+    sleep 60 & wait $!
   done
   return $rc
 }
