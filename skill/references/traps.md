@@ -209,3 +209,31 @@ UU_LINK_CLI=/tmp/mockcli HOME=/tmp/sandbox uulink watch --once
 ⇒ 说明 mock 没生效，正在打真实 CLI。立刻停下，去 UU 客户端清会话。
 
 回归脚本 `regress-watch.sh` 已按这个约定写好（7 组用例、18 项断言），改完看护先跑它。
+
+### 8.5 想人为制造「通路不通」来演练自愈：CLI 那两条路都不动映射
+
+实测（2026-10-22，v1.0.7）：
+
+| 命令 | 预期 | 实测 |
+|---|---|---|
+| `uuyc-cli device disconnect <id>` | 端口消失或变幽灵 | **端口仍 LISTEN，banner 照常返回** `SSH-2.0-OpenSSH_for_Windows_9.5` |
+| `uuyc-cli term exit <id>` | 结束会话、端口消失 | **同样无效**（帮助原文「会话保留」） |
+
+两条命令都返回空、`rc=0`，但通路毫无变化。**别把"没输出"当"断成功了"**——演练前必须先读一次 banner 确认真的断了，否则整场演练是在测一条好好的链路。
+
+真正能制造故障的只剩三条，都有代价：
+- 点「端口映射」面板的开关：GUI，AppleScript 能枚举到该窗口，但里面只有 `AXButton` 和 `image icon port mapping status succe`，没有可靠的 checkbox 定位，盲点风险大
+- 重启 UU（`uulink down --force -y`）：冷启动后端口可能不绑，需要人工再点一次开关才恢复
+- 网络层阻断（pf）：要 sudo
+
+**替代做法（无风险、可逆、覆盖 90%）**：把 `devices.tsv` 里该设备的 localport 临时改成一个**没有映射规则的端口**（如 2224），跑一轮 `uulink watch --once`。能看到完整控制流：
+
+```
+TARS :2224 不通（第 1 次补救），开始自愈
+  term open 成功，等 banner（最多 45s）
+  自愈失败（对端掉线或 sshd 未运行）      ← 45s 后
+```
+
+检测 → 双采样 → 查设备在线 → 真实 `term open` 返回 success → banner 严格等满 45s → 判失败 → `fails+1`，全部覆盖。唯一不覆盖的是「端口最终绑上」那一步（取决于 UU 的映射机制，不是脚本逻辑）。改完记得改回。
+
+**顺手一个坑**：BSD `sed` 不支持 `\t`，`sed 's/^\(TARS\t-\)2222/\1222 4/'` 会静默不替换。改 tsv 用 python 按 `split("\t")` 处理。
