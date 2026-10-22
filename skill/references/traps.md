@@ -17,11 +17,11 @@ $ perl -MIO::Socket::INET -MTime::HiRes=time -e '...读 banner 计时...'
 对照（同一天、同两台机器）：
 
 ```
-$ ssh Administrator@100.100.100.10 'hostname'      # Tailscale 公网路径
-ssh: connect to host 100.100.100.10 port 22: Operation timed out
+$ ssh Administrator@<TAILSCALE_IP> 'hostname'      # Tailscale 公网路径
+ssh: connect to host <TAILSCALE_IP> port 22: Operation timed out
 ```
 
-同日更早（13:10）在 Mac 侧跑 `tailscale ping -c 3 100.100.100.10`，三次 **330 / 372 / 331 ms**，路径为 `DERP(sfo)`、`direct connection not established`。原始记录见项目内「连接稳定性排查」文档的 F2 项。SKILL.md 里"330ms / 快约 7 倍"这个说法就来自这里，注意它是 `tailscale ping`（走 DERP）的口径，与上表 banner 往返不是同一种测量。
+同日更早（13:10）在 Mac 侧跑 `tailscale ping -c 3 <TAILSCALE_IP>`，三次 **330 / 372 / 331 ms**，路径为 `DERP(sfo)`、`direct connection not established`。原始记录见项目内「连接稳定性排查」文档的 F2 项。SKILL.md 里"330ms / 快约 7 倍"这个说法就来自这里，注意它是 `tailscale ping`（走 DERP）的口径，与上表 banner 往返不是同一种测量。
 
 ## 2. 「能连上」不等于「通」——两次实例
 

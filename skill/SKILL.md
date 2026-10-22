@@ -43,6 +43,8 @@ git clone <repo> && cd uu-link && ./install.sh
 
 ## 从零跑通的完整顺序（别跳步）
 
+> 加新机器时按 `references/new-machine-checklist.md` 逐项打勾。
+
 1. `./install.sh` —— 命令进 PATH
 2. `uulink list` —— 拿到目标设备的**准确名称**
 3. 在 **UU 图形界面**给这台设备加映射（见下节）
@@ -171,5 +173,6 @@ ssh -p 2223 <A 的用户名>@127.0.0.1
 
 ## 深层资料
 
+- `references/new-machine-checklist.md`：**新机器上线清单**（加一台设备时照着逐项打勾）
 - `references/traps.md`：每条结论的原始命令与输出
 - `scripts/click.swift`：Qt 自绘按钮点不动的绕法（发 CGEvent 真实鼠标事件）。**只在需要自动化 GUI 时参考，`uulink` 本身不调用它**
