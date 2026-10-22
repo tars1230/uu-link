@@ -133,4 +133,57 @@ $ find ~/Library -maxdepth 4 -iname '*portmap*'              → 无
 - **screencapture -R 用像素、System Events 用点**，只有两者相等（非 Retina / 1:1）才可直接换算；窗口被遮挡时截到的是上层窗口，先 `AXRaise`。
 - **往 GUI `keystroke` 前先切英文输入法**：微信输入法会把 `sshd` 合成"谁说的"、`ft` 合成"丰田"。
 - **AX click 对 Qt 自绘按钮无效**，要发真实鼠标事件（CGEvent）。本轮用的 12 行 Swift 点击器在 `scripts/click.swift`。
-- **`scp` 在幽灵期会挂死**（>2 分钟无输出）。健康通道上的 scp 尚未验证。
+- **`scp` 在幽灵期会挂死**（>2 分钟无输出）。健康通道上已验证：见 §8。
+
+## 8. 隧道「活着」但链路死了（第三种幽灵），以及 scp 的四向验证
+
+### 8.1 现场：进程在、退出码 0、CPU 0%，但整条是死的
+
+对端掉线期间，`launchd` 管着的反向隧道表现如下：
+
+```
+$ launchctl list | grep mac-reverse
+94591   0   com.chengchen.mac-reverse-tunnel          # PID 在，上次退出码 0
+
+$ ps -o pid,stat,%cpu -p 94591
+94591   S   0.0                                        # 完全空闲，不报错
+
+$ lsof -nP -a -p 94591 -iTCP
+ssh 94591  TCP 127.0.0.1:60997->127.0.0.1:2222 (ESTABLISHED)   # 显示"已连接"
+```
+
+同时读该通路的 banner：
+
+```
+$ python3 -c "import socket;s=socket.create_connection(('127.0.0.1',2222),timeout=6);print(s.recv(64))"
+（超时 / 空）
+```
+
+**根因**：UU 本地代理在链路已死时仍让 socket 保持 `ESTABLISHED`，`ssh` 往里写既不报错也不超时。于是 `-o ServerAliveInterval=20 -o ServerAliveCountMax=3` **探不到**（它靠"写出去、等到超时没回应"来判定，而这里写出去对方默默吞掉），进程永不退出 ⇒ `launchd` 的 `KeepAlive` 永不触发（它只在进程退出后拉起）。结果是隧道"永远在线"的假象，同时在对端留下幽灵监听（远端 `LISTEN` 在、读不到 banner）。
+
+**结论**：无人值守的隧道，健康判据只能是**banner 级**，且必须由外部定时器驱动（`uulink watch`，`StartInterval=60`）；进程级/端口级检查在这个链路上是无效的。
+
+### 8.2 `nc` 读 banner 的恒定假阴性
+
+```
+$ nc -G 6 127.0.0.1 2222 </dev/null | head -c 40    # 空
+$ nc -d -G 6 127.0.0.1 2222 | head -c 40            # SSH-2.0-OpenSSH_for_Windows_9.5
+```
+
+同一条健康链路，两种写法两个结论。macOS 的 `nc` 默认读 stdin，`</dev/null` 让它一 EOF 就退出、来不及读 banner。**这不是"偶尔失灵"，是恒定假阴性**——链路好和坏都返回空，等于把判据废掉。要么加 `-d`，要么用 python socket。
+
+### 8.3 scp 四向验证（双向 × 正反通道）
+
+样本：512KB 随机文件，两端 SHA256 比对。
+
+| 通道 | 方向 | 结果 | 耗时 |
+|---|---|---|---|
+| 正向 `-P 2222` | Mac → 对端 | RC=0，SHA 一致 | 1.69 s |
+| 正向 `-P 2222` | 对端 → Mac | RC=0，字节一致 | 1.29 s |
+| 反向 `-P 2223` | 对端 → Mac | RC=0，SHA 一致 | 1014 ms |
+| 反向 `-P 2223` | Mac → 对端 | RC=0，SHA 一致 | 586 ms |
+
+两条附带结论：
+
+- **必须用 ssh 别名**（`scp file tars:`）。直接写 `-p 2222 user@127.0.0.1` 会 `Permission denied (publickey)`——密钥绑在别名的 `IdentityFile` 上，裸 IP 那条没有 identity。
+- **scp 挂死不一定是通道问题**：本轮最初两次"scp 卡住"都是对端掉线造成的，链路恢复后同一命令 1 秒内完成。先读 banner 再怀疑 scp。

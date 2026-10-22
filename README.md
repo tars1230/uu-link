@@ -64,17 +64,54 @@ uulink list              # 设备列表 + 哪些已配通路
 uulink up office-pc      # 没通路就自己建会话，通了才返回
 uulink ssh office-pc     # 进去
 uulink ssh office-pc 'hostname; whoami'
+uulink watch --install   # 装常驻看护：每分钟 banner 检测，断了自动修
 ```
 
 `up` 建的是**轻会话**（UU 的远程终端，不拉整块桌面），起来后会自动把弹出的窗口关掉。窗口关掉不影响映射。
 
-## 三条铁律
+## 断线自愈：`uulink watch`
+
+`up` 是"人发现不通了才去修"。**无人值守的隧道需要看护**，而这个仓库踩过的最大一个坑就是：**launchd 的 `KeepAlive` 保不住它**。
+
+链路死掉时，UU 本地代理仍让 socket 保持 `ESTABLISHED`，`ssh` 往里写既不报错也不超时，于是 `-o ServerAliveInterval=20` 根本探不到 —— 进程永不退出，`KeepAlive` 也就永不触发（它只管"进程死了再拉起"，管不了"进程活着但链路是死的"）。结果：隧道"看起来一切正常"，实际整条是死的，同时在对端留下一个幽灵监听。
+
+所以看护只有一个判据：**读得到 banner 才算通**。
+
+```bash
+uulink watch --install     # 装 launchd 常驻（每 60s 一轮），装完立刻生效
+uulink watch --once        # 只跑一轮，看它怎么判断
+uulink watch               # 前台循环（调试用）
+uulink watch --uninstall   # 卸掉
+```
+
+每轮做三件事：banner 不通 → 重启 `~/.config/uulink/tunnels.tsv` 里登记的常驻隧道（踢掉死 socket 上的旧连接）→ `term open` 重建会话并等 banner。
+
+**断网时它会自动退避**（连续失败 3 次后改 15 分钟一次），不会每分钟硬撞；设备在 UU 里显示离线时干脆不试。状态和流水账：
+
+```bash
+cat ~/.config/uulink/watch.state   # 每台设备连续失败次数
+tail ~/.config/uulink/watch.log    # 什么时候断的、自愈成功没有
+uulink check                       # 末尾会显示"看护上次运行"
+```
+
+装了看护记得登记依赖隧道，否则它只会修通路、不会重启隧道：
+
+```
+# ~/.config/uulink/tunnels.tsv    设备名<TAB>launchd 标签
+office-pc	com.example.mac-reverse-tunnel
+```
+
+关于窗口：`term open` 会拉起一个 UU 终端窗口。**手动在终端里跑** `uulink watch` 时会顺手关掉；但 launchd 环境下不会去碰 System Events（那里弹「自动化」授权框没人能点，会一直卡着），所以无人值守时窗口可能累积——不影响通路，介意就手动关。
+
+## 四条铁律
 
 **① 不要用 `device disconnect` 收尾。** 它会把端口变成"幽灵监听"——`lsof` 还看得见、`nc` 还连得上，但后端已死，SSH 卡在 banner 交换，命令行清不掉。`term exit`（帮助原文"会话保留"）和关窗口也都关不掉会话。
 
 **② 避免端口冲突靠"每台设备不同 localPort"，不靠"用完关掉"。** office-pc 用 2222、家里用 2223、N100 用 2224，多台可同时在线互不干扰。
 
 **③ 判断"通"必须读到协议层 banner。** TCP 能连 ≠ 通。这个仓库里两次栽在这上面（公网中间盒、幽灵监听），所以脚本的健康判定是 `chan_ok`（读 `SSH-` banner），不是 `nc -z`。
+
+**④ 常驻隧道必须配 `uulink watch`，不能只靠 launchd 的 `KeepAlive`。** `KeepAlive` 只在进程**退出**时生效；链路死了而进程不退，它就永远不会触发。这不是理论——本仓库实测到隧道"假装在线"空转了十几分钟，而 `launchctl` 全程报退出码 `0`、CPU `0.0%`、`lsof` 显示 `ESTABLISHED`。
 
 ## 排障
 
@@ -83,6 +120,7 @@ uulink ssh office-pc 'hostname; whoami'
 | 面板显示「✓ 成功」但端口不监听 | **UU 冷启动后规则不会自动绑** | 把那条开关**关一次再开一次** |
 | 端口在、`nc` 通、SSH 卡 banner | 幽灵监听 | `uulink down <名称> --force` 重启 UU，然后按上一条重绑 |
 | 设备离线 | 目标机 UU 没开/没登录 | 到那台机器把 UU 开起来 |
+| 隧道进程在、`launchctl` 报退出码 0，但怎么都不通 | 链路死了而进程没退（`KeepAlive` 不触发） | `uulink watch --install` 后交给看护；临时可 `launchctl kickstart -k gui/$UID/<标签>` |
 | 每条命令 1.4–1.8 s | Windows 每条新起 PowerShell | 正常；进交互会话后就不重启 shell 了 |
 
 ## 装完连不上？按这个顺序查
@@ -131,6 +169,23 @@ ssh -p 2223 <A 的用户名>@127.0.0.1
 **⑤ 别在一条通道上并发做重活**
 
 同一时刻跑着 `ssh -fN` 隧道、另一个 `uulink ssh`、再来个 `scp`，可能拿到 `Connection closed by 127.0.0.1 port 2222`。不是通道坏了——串行做就好。
+
+**⑥ 用 `nc` 读 banner 时，别把 stdin 接到 `/dev/null`**
+
+这是个纯假阴性，害我误判过一次"链路挂了"：
+
+```bash
+nc -G 6 127.0.0.1 2222 </dev/null | head -c 40     # 什么都不输出，像后端拒绝
+nc -d -G 6 127.0.0.1 2222 | head -c 40             # b'SSH-2.0-OpenSSH_...' 正确
+```
+
+原因：macOS 的 `nc` 默认会读 stdin，stdin 一 EOF 它就直接退出、来不及读 banner。加 `-d`（man 原文 "do not attempt to read from stdin"）才对。**链路正常时这个写法同样是空的**，所以它不是"偶尔失灵"，是恒定假阴性。
+
+要探 banner 就用脚本里的 `chan_ok` 或：
+
+```bash
+python3 -c "import socket;s=socket.create_connection(('127.0.0.1',2222),timeout=6);print(s.recv(64))"
+```
 
 ## 边界
 

@@ -9,6 +9,9 @@
 #          只能等新会话顶上去，或重启 UU（重启后还要手动把映射开关重置一次）
 #   · 【因此】判断"通不通"绝不能只看 TCP 能连，必须读到 SSH banner
 #   · 关掉终端窗口不影响映射（映射挂在会话上，不挂在窗口上）
+#   · 【坑】链路死掉时 UU 本地代理仍让 socket 保持 ESTABLISHED，ssh 既不报错也不
+#          超时 ⇒ -o ServerAliveInterval 探不到 ⇒ 进程永不退出 ⇒ launchd 的
+#          KeepAlive 永不触发（它只管"进程死了再拉起"）。所以看护必须做 banner 级。
 #
 # 用法：
 #   uulink                 体检（只读）
@@ -18,6 +21,8 @@
 #   uulink ssh [名称] [命令...]   直连；不带命令进交互 shell
 #   uulink down            解释为什么"关掉单向连接"不该做
 #   uulink down [名称] --force [-y]   重启 UU 清掉幽灵端口（会断所有远控）
+#   uulink watch [--once] [--quiet]   看护一轮：banner 检测 + 自愈（给 launchd 用）
+#   uulink watch --install | --uninstall   装/卸每分钟一次的看护常驻
 #
 set -uo pipefail
 
@@ -34,13 +39,15 @@ fi
 CFG="$HOME/.config/uulink/devices.tsv"
 KH="$HOME/.config/uulink/known_hosts"
 PY="$(command -v python3 || echo /usr/bin/python3)"
+# 看护在 launchd 下跑时不许碰 System Events（会弹「自动化」授权框，且无人可点）
+NO_OSA=0
 
 die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 ok()  { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 warn(){ printf '\033[33m! %s\033[0m\n' "$*"; }
 info(){ printf '  %s\n' "$*"; }
 
-[ -x "$UUCLI" ] || die "找不到 uuyc-cli：$UUCLI（可用 UU_LINK_CLI 指定路径）"
+[ -x "$UUCLI" ] || die "找不到 uuyc-cli：${UUCLI}（可用 UU_LINK_CLI 指定路径）"
 
 # 所有 CLI 调用都带 20s 超时——UU 客户端偶发不返回时，不能把整个 up 挂死
 uu() {
@@ -169,6 +176,7 @@ wait_chan() { # $1=port $2=墙钟超时秒（按真实时间，不按循环次�
 
 # 只关 UU 自己的 sessionN 窗口（清理，不影响映射），不碰别的应用
 close_session_windows() {
+  [ "$NO_OSA" = "1" ] && return 0
   osascript <<'OSA' 2>/dev/null
 tell application "System Events"
   if not (exists process "UURemote") then return
@@ -225,7 +233,22 @@ print("  版本 %s  登录 %s  网络 %s" % (d.get("appVersion"), d.get("isLogge
       info "$name  127.0.0.1:$port 无监听 → uulink up ${name}"
     fi
   done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
-  [ $found -eq 1 ] || info "还没配设备：编辑 $CFG（模板里有格式），或先 uulink list 看设备名"
+  [ $found -eq 1 ] || info "还没配设备：编辑 ${CFG}（模板里有格式），或先 uulink list 看设备名"
+  local lr fails
+  lr=$(awk -F'\t' '$1=="_run"{print $2}' "$STATE" 2>/dev/null | tail -1)
+  if [ -n "${lr:-}" ]; then
+    info "看护：上次运行 $(date -r "$lr" '+%m-%d %H:%M:%S' 2>/dev/null || echo "$lr")（日志 ${WLOG}）"
+    while IFS=$'\t' read -r name _ port _ _; do
+      case "${name:-}" in ''|\#*) continue;; esac
+      fails=$(awk -F'\t' -v n="$name" '$1==n{print $2}' "$STATE" 2>/dev/null)
+      [ "${fails:-0}" -gt 0 ] 2>/dev/null && warn "  $name 连续失败 ${fails} 次（看护在退避重试）"
+    done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
+  elif [ -f "$WATCH_PLIST" ]; then
+    info "看护：plist 已装但还没跑过（launchctl list | grep $WATCH_LABEL）"
+  else
+    info "看护未启用：uulink watch --install（每分钟 banner 检测，断了自动修）"
+  fi
+  return 0   # 体检只是报告，健康也不代表"命令失败"；这里以前漏了，会让 install.sh 自检误判
 }
 
 cmd_up() {
@@ -372,6 +395,248 @@ cmd_ssh() {
   exec ssh "${sshargs[@]}" "$user@127.0.0.1" "$@"
 }
 
+# ---------- 看护（banner 级健康检查 + 自愈） ----------
+# 为什么非得 banner 级：链路死时 UU 代理仍让 socket 保持 ESTABLISHED，ssh 写进去
+# 不报错也不超时 ⇒ ServerAliveInterval 探不到 ⇒ 进程不退出 ⇒ KeepAlive 不触发。
+# 实测：反向隧道曾这样"假装活着"空转 20 分钟，同时在对端留下幽灵监听。
+STATE="$HOME/.config/uulink/watch.state"    # 每行：名称<TAB>连续失败数<TAB>上次尝试epoch
+WLOG="$HOME/.config/uulink/watch.log"       # 人读的流水账
+TUNNELS="$HOME/.config/uulink/tunnels.tsv"  # 每行：设备名<TAB>launchd标签
+LOCK="$HOME/.config/uulink/watch.lock"
+WATCH_PLIST="$HOME/Library/LaunchAgents/com.uulink.watch.plist"
+WATCH_LABEL="com.uulink.watch"
+
+watch_state() { # $1=名称 → 输出 fails<TAB>last_attempt（两列都强制为数字）
+  [ -f "$STATE" ] || { printf '0\t0'; return; }
+  # 必须校验：状态文件被手改或写坏时，$(( )) 会把非数字当成变量名，set -u 下直接崩
+  awk -F'\t' -v n="$1" '
+    $1==n { a=$2; b=$3; hit=1; exit }
+    END {
+      if (a !~ /^[0-9]+$/) a=0
+      if (b !~ /^[0-9]+$/) b=0
+      printf "%s\t%s", a, b
+    }' "$STATE"
+}
+
+watch_put() { # $1=名称 $2=fails $3=last_attempt
+  local tmp; mkdir -p "$(dirname "$STATE")"
+  tmp="$STATE.$$"
+  { [ -f "$STATE" ] && awk -F'\t' -v n="$1" '$1!=n' "$STATE"; printf '%s\t%s\t%s\n' "$1" "$2" "$3"; } >"$tmp" \
+    && mv -f "$tmp" "$STATE"
+}
+
+lock_alive() { # 锁目录里的 pid 是否还是个活进程
+  local p
+  [ -f "$LOCK/pid" ] || return 1
+  p=$(cat "$LOCK/pid" 2>/dev/null)
+  case "${p:-}" in ''|*[!0-9]*) return 1 ;; esac
+  ps -p "$p" >/dev/null 2>&1
+}
+
+wlog() {
+  mkdir -p "$(dirname "$WLOG")"
+  # 200KB 轮转一份，别让它无限长
+  if [ -f "$WLOG" ] && [ "$(wc -c <"$WLOG" 2>/dev/null || echo 0)" -gt 204800 ]; then
+    mv -f "$WLOG" "$WLOG.1"
+  fi
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$WLOG" 2>/dev/null || true
+}
+
+kick_tunnels() { # $1=设备名：把依赖这条通路的常驻隧道重启（踢掉死 socket 上的旧连接）
+  local n lab
+  [ -f "$TUNNELS" ] || return 0
+  while IFS=$'\t' read -r n lab; do
+    case "${n:-}" in ''|\#*) continue;; esac
+    [ "$n" = "$1" ] || continue
+    [ -n "${lab:-}" ] || continue
+    if launchctl kickstart -k "gui/$(id -u)/$lab" >/dev/null 2>&1; then
+      wlog "  kickstart $lab"
+    else
+      wlog "  kickstart $lab 失败（标签不存在或未 bootstrap）"
+    fi
+  done < <(grep -v '^[[:space:]]*#' "$TUNNELS" 2>/dev/null || true)
+  return 0
+}
+
+try_open() { # $1=设备名 $2=端口 $3=id → 0=已通
+  local r
+  r=$(uu term open "$3")
+  if ! printf '%s' "$r" | grep -q '"success" *: *true'; then
+    wlog "  term open 失败：$(uu_msg "$r")"
+    return 1
+  fi
+  wlog "  term open 成功，等 banner（最多 45s）"
+  if wait_chan "$2" 45; then
+    # 手动在终端里跑就顺手把拉起的终端窗口关掉；launchd 下 NO_OSA=1 会自动跳过
+    close_session_windows
+    return 0
+  fi
+  return 1
+}
+
+cmd_watch() {
+  local once=0 quiet=0 install=0 uninstall=0 a
+  for a in "$@"; do
+    case "$a" in
+      --once) once=1 ;;
+      -q|--quiet) quiet=1 ;;
+      --install) install=1 ;;
+      --uninstall) uninstall=1 ;;
+      *) die "watch 不认识参数：$a" ;;
+    esac
+  done
+  [ $install -eq 1 ] && { watch_install; return $?; }
+  [ $uninstall -eq 1 ] && { watch_uninstall; return $?; }
+
+  # 只有"没人看着"的时候才禁 osascript：launchd 没有 TTY，弹授权框就永远卡住
+  [ -t 1 ] || NO_OSA=1
+
+  # 单实例：上一轮还没跑完就跳过，避免两轮同时补救打架
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    if lock_alive; then
+      [ $quiet -eq 0 ] && info "上一轮看护还在跑，本轮跳过"
+      return 0
+    fi
+    # 另一个实例可能刚 mkdir 完、还没写 pid（这个窗口里不能直接抢锁，
+    # 否则会把它的活锁删掉，导致两轮同时在补救）
+    [ -f "$LOCK/pid" ] || sleep 1
+    if lock_alive; then
+      [ $quiet -eq 0 ] && info "上一轮看护还在跑，本轮跳过"
+      return 0
+    fi
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || return 0
+  fi
+  echo $$ >"$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+
+  while :; do
+    local name _ port _ _ now fails last gap devlist id rc=0
+    now=$(date +%s)
+    devlist=$(list_devices 2>/dev/null)   # 每轮只取一次，别在循环里反复调 CLI
+
+    while IFS=$'\t' read -r name _ port _ _; do
+      case "${name:-}" in ''|\#*) continue;; esac
+      [ -n "${port:-}" ] || continue
+
+      if chan_ok "$port"; then
+        read -r fails last < <(watch_state "$name")
+        if [ "${fails:-0}" -gt 0 ] 2>/dev/null; then
+          wlog "$name :$port 恢复（此前连续失败 $fails 次）"
+          [ $quiet -eq 0 ] && ok "$name :$port 恢复"
+        fi
+        # 成功时把 last_attempt 一起清零：退避只该由"补救过但没成功"来触发，
+        # 否则刚恢复时又会因为"上次成功很近"把下一次真实断线的首修推迟一整个退避窗
+        watch_put "$name" 0 0
+        continue
+      fi
+
+      read -r fails last < <(watch_state "$name")
+      fails=$(( ${fails:-0} + 1 ))
+      # 退避：断网是常态，别每分钟硬撞；连续失败 3 次后间隔拉到 15 分钟
+      gap=120; [ "$fails" -ge 3 ] && gap=900
+      if [ "${last:-0}" -gt 0 ] && [ $(( now - last )) -lt "$gap" ]; then
+        # 记下失败轮数，但不动 last —— last 是"上次真正尝试"的时刻，退避基准不能漂
+        watch_put "$name" "$fails" "$last"
+        [ $quiet -eq 0 ] && info "$name :$port 仍不通（连续 $fails 次），退避中"
+        continue
+      fi
+
+      # 先看 UU 自己的设备状态再决定要不要动手。这里必须区分三种情况，
+      # 否则"配置里名字写错"会被误报成"设备离线"，人就会一直等一台不存在的机器。
+      if [ -n "${devlist:-}" ]; then
+        if ! printf '%s\n' "$devlist" | awk -F'\t' -v n="$name" 'tolower($1)==tolower(n){f=1}END{exit !f}'; then
+          wlog "$name :$port 不通，且 UU 设备列表里查无此设备（名字写错？）→ 跳过"
+          [ $quiet -eq 0 ] && warn "$name 不在 UU 设备列表里，检查 devices.tsv 的名字"
+          # 没真正尝试过，别写 last：设备一旦回来应当立刻重试，而不是等退避窗走完
+          watch_put "$name" "$fails" "$last"
+          continue
+        fi
+        if ! printf '%s\n' "$devlist" | awk -F'\t' -v n="$name" 'tolower($1)==tolower(n)&&$3=="1"{f=1}END{exit !f}'; then
+          wlog "$name :$port 不通，且该设备在 UU 里显示离线 → 不尝试自愈"
+          [ $quiet -eq 0 ] && warn "$name 设备离线，等它回来"
+          watch_put "$name" "$fails" "$last"
+          continue
+        fi
+      else
+        # 取不到设备列表（CLI 超时/客户端异常）≠ 设备离线，别因此放弃补救
+        wlog "$name :$port 不通，且 uu device list 无输出（CLI 异常）→ 仍尝试自愈"
+      fi
+
+      [ $quiet -eq 0 ] && warn "$name :$port 不通（连续 $fails 次），开始自愈"
+      wlog "$name :$port 不通（连续 $fails 次），开始自愈"
+      kick_tunnels "$name"
+      id=$(printf '%s\n' "$devlist" | awk -F'\t' -v w="$name" 'tolower($1)==tolower(w){print $2; exit}')
+      if [ -z "${id:-}" ]; then
+        wlog "  UU 设备列表里找不到「${name}」，跳过"
+        watch_put "$name" "$fails" "$now"
+        continue
+      fi
+      if try_open "$name" "$port" "$id"; then
+        wlog "  自愈成功"
+        [ $quiet -eq 0 ] && ok "$name :$port 自愈成功"
+        watch_put "$name" 0 0
+      else
+        wlog "  自愈失败（对端掉线或 sshd 未运行）"
+        [ $quiet -eq 0 ] && warn "$name :$port 自愈失败"
+        watch_put "$name" "$fails" "$now"
+        rc=3
+      fi
+    done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
+
+    watch_put _run "$now" "$now"
+    [ $once -eq 1 ] && break
+    sleep 60
+  done
+  return $rc
+}
+
+watch_install() {
+  local self pl
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  pl="$WATCH_PLIST"
+  mkdir -p "$(dirname "$pl")" "$(dirname "$STATE")"
+  cat >"$pl" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$WATCH_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$self</string>
+    <string>watch</string>
+    <string>--once</string>
+    <string>--quiet</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>$HOME/.config/uulink/watch.err</string>
+</dict>
+</plist>
+EOF
+  if [ ! -f "$TUNNELS" ]; then
+    cat >"$TUNNELS" <<'EOF'
+# 哪条通路挂了，就该重启哪些常驻隧道。格式：设备名<TAB>launchd 标签
+# 例：TARS	com.example.mac-reverse-tunnel
+EOF
+  fi
+  launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null
+  if launchctl bootstrap "gui/$(id -u)" "$pl"; then
+    ok "看护已启用：${pl}（每 60s 一轮，日志 ${WLOG}）"
+    info "记得在 ${TUNNELS} 里登记依赖隧道，否则只会修通路、不会重启隧道"
+  else
+    die "bootstrap 失败：launchctl bootstrap gui/$(id -u) $pl"
+  fi
+}
+
+watch_uninstall() {
+  launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null
+  rm -f "$WATCH_PLIST"
+  ok "看护已停用（$WATCH_PLIST 已删）"
+}
+
 # ---------- 入口 ----------
 ensure_cfg
 case "${1:-check}" in
@@ -380,6 +645,7 @@ case "${1:-check}" in
   up)    shift; cmd_up "$@" ;;
   down)  shift; cmd_down "$@" ;;
   ssh)   shift; cmd_ssh "$@" ;;
-  -h|--help|help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+  watch) shift; cmd_watch "$@" ;;
+  -h|--help|help) sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' ;;
   *) die "未知子命令：$1（试试 uulink help）" ;;
 esac

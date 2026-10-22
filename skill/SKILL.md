@@ -3,7 +3,7 @@ name: uu-link
 description: 通过网易 UU 远程自带的端口映射，建立到任意一台 UU 账号设备的 SSH 通路，含自动建会话、通路健康判定与排障。This skill should be used when the user asks to 连接/操控另一台电脑、建跨机通道、去另一台机器取文件或跑命令，或提到 uulink、UU 端口映射、办公室电脑、家里的电脑。
 description_zh: "用 UU 远程端口映射一键建立跨机 SSH 通路；用户提到 uulink、UU 端口映射、连办公室/家里的电脑时使用"
 description_en: "One-command SSH channel to any device on your UU Remote account; use when asked to reach another machine via UU port mapping"
-version: 1.0.4
+version: 1.0.5
 agent_created: true
 allowed-tools: Bash,Read
 metadata:
@@ -82,9 +82,11 @@ uulink list             # 设备列表 + 哪些已配通路
 uulink up <名称>        # 没通路就自己建，通了才返回
 uulink ssh <名称> 'hostname'
 uulink down             # 解释为什么"关掉单向连接"不该做（不执行任何动作）
+uulink watch --install  # 常驻看护：每 60s banner 检测 + 自愈（无人值守必装）
+uulink watch --once     # 只跑一轮；--uninstall 卸载
 ```
 
-## 三条铁律
+## 四条铁律
 
 **① 禁止用 `device disconnect` 收尾。** 它会把端口变成**幽灵监听**：`lsof` 还看得见、`nc -z` 还成功，但后端已死，SSH 卡在 banner 交换。`term exit`（帮助原文「会话保留」）和关窗口也都关不掉会话。
 遇到幽灵的正确顺序是：**先 `uulink up` 让新会话顶上；顶不掉再 `uulink down <名称> --force`** 重启 UU（注意 `--force` 会断所有远控，非交互环境必须显式加 `-y`）。
@@ -93,11 +95,14 @@ uulink down             # 解释为什么"关掉单向连接"不该做（不执�
 
 **③ 判断"通"必须读到协议层 banner。** TCP 能连 ≠ 通。健康判定是 `chan_ok`（读 `SSH-` banner），不是 `nc -z`。注意它强绑定 SSH 协议——映射到非 SSH 服务会被判不通。
 
+**④ 常驻隧道必须配 `uulink watch`，不能只靠 launchd `KeepAlive`。** `KeepAlive` 只在进程**退出**时生效。链路死时 UU 本地代理仍让 socket 保持 `ESTABLISHED`，`ssh` 写进去不报错也不超时 ⇒ `ServerAliveInterval` 探不到 ⇒ 进程永不退出 ⇒ `KeepAlive` 永不触发。此时 `launchctl` 报退出码 `0`、CPU `0.0%`、`lsof` 显示 `ESTABLISHED`，一切"正常"，但整条是死的，并且对端会留下幽灵监听。
+
 ## 稳定性边界（重要）
 
 - **规则本身配一次就长期存在**（不会因为重连消失）
 - **但端口绑定在「UU 冷启动/重启后」不会自动恢复**：必须去面板把那条开关**关一次再开一次**
 - 所以这不是「装完永久在线」的链路，是「开机后、或重启 UU 后，需要一次点击」的链路
+- **进程活着 ≠ 链路活着**：`KeepAlive` 只处理「进程死了」，处理不了「进程活着但链路死了」。要无人值守，必须上 `uulink watch`（banner 级判据 + 自动重建会话 + 断网退避）
 
 ## 排障（按出现概率）
 
@@ -107,6 +112,7 @@ uulink down             # 解释为什么"关掉单向连接"不该做（不执�
 | 端口在、`nc` 通、SSH 卡 banner | 幽灵监听 | 先 `uulink up <名称>` 顶替；顶不掉再 `uulink down <名称> --force -y`，之后仍需按上一条重绑 |
 | `term open` 返回成功但没反应 | 该返回只代表请求已派发 | 等 `up` 的健康判定结果 |
 | 设备离线 | 目标机 UU 没开/没登录 | `uulink list` 确认；到那台机器把 UU 开起来 |
+| 隧道进程在、退出码 0，就是不通 | 链路死了而进程没退 | `uulink watch --install`；临时 `launchctl kickstart -k gui/$UID/<标签>` |
 | `up` 说就绪但 `ssh` 被拒 | 认证没过，不是通路问题 | 查被控端 sshd 与公钥 |
 | 每条命令 1.4–1.8s | Windows 每条新起 PowerShell | 正常。进交互会话后就不重启 shell 了 |
 

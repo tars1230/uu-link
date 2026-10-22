@@ -50,6 +50,11 @@ if "$BIN_DIR/uulink" check; then
   say "    1. 在 UU 里给目标设备加一条端口映射（本地 2222 → 127.0.0.1:22）"
   say "    2. 把设备写进 ~/.config/uulink/devices.tsv"
   say "    3. uulink up <名称> && uulink ssh <名称>"
+  say ""
+  warn "如果这条通路要无人值守（比如开机就挂着的隧道），还要装看护："
+  say "    uulink watch --install"
+  say "  不装的话，链路断掉时 ssh 进程不会退出，launchd 的 KeepAlive 也就不会触发，"
+  say "  隧道会「看起来在线」但实际上整条是死的（详见 references/traps.md §8）。"
 else
   warn "自检没跑完，先确认 UU 已登录"
 fi
