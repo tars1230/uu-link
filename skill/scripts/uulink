@@ -356,13 +356,20 @@ EOF
   fi
 
   info "退出 UU …"
-  osascript -e 'tell application id "com.netease.uuremote" to quit' 2>&1 | head -2
+  # 先走正常退出，让它自己清理端口和会话。注意：这句 osascript 需要「自动化」权限，
+  # 没授权时会被系统直接拒（execution error ... -128），此时干等 10 秒毫无意义。
+  if ! osascript -e 'tell application id "com.netease.uuremote" to quit' >/dev/null 2>&1; then
+    warn "正常退出被系统拒绝（多半是「自动化」权限未授予）→ 改用 SIGTERM"
+    killall -TERM UURemote 2>/dev/null || true
+  fi
   local i=0
   while [ $i -lt 20 ]; do pgrep -x UURemote >/dev/null 2>&1 || break; sleep 0.5; i=$((i+1)); done
   if pgrep -x UURemote >/dev/null 2>&1; then
     warn "UU 没退出干净，再等 5 秒"
     sleep 5
-    pgrep -x UURemote >/dev/null 2>&1 && die "UU 仍在运行，请手动退出后重试（端口未释放）"
+    pgrep -x UURemote >/dev/null 2>&1 && die "UU 退不掉：osascript 和 SIGTERM 都没用（端口未释放）
+  1) 手动退出：点菜单栏 UU 图标 → 退出（或 ⌘Q）
+  2) 或者给终端「自动化」权限：系统设置 → 隐私与安全性 → 自动化 → 勾选你的终端，再重试"
   fi
 
   info "重新拉起 UU …"
