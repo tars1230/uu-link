@@ -234,17 +234,20 @@ print("  版本 %s  登录 %s  网络 %s" % (d.get("appVersion"), d.get("isLogge
     fi
   done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
   [ $found -eq 1 ] || info "还没配设备：编辑 ${CFG}（模板里有格式），或先 uulink list 看设备名"
-  local lr fails
-  lr=$(awk -F'\t' '$1=="_run"{print $2}' "$STATE" 2>/dev/null | tail -1)
-  if [ -n "${lr:-}" ]; then
+  local lr fails loaded=0
+  launchctl list "$WATCH_LABEL" >/dev/null 2>&1 && loaded=1
+  lr=$(awk -F'\t' '$1=="_run"{print $2; exit}' "$STATE" 2>/dev/null)
+  if [ $loaded -eq 1 ] && [ -n "${lr:-}" ]; then
     info "看护：上次运行 $(date -r "$lr" '+%m-%d %H:%M:%S' 2>/dev/null || echo "$lr")（日志 ${WLOG}）"
     while IFS=$'\t' read -r name _ port _ _; do
       case "${name:-}" in ''|\#*) continue;; esac
-      fails=$(awk -F'\t' -v n="$name" '$1==n{print $2}' "$STATE" 2>/dev/null)
+      fails=$(awk -F'\t' -v n="$name" '$1==n{print ($2 ~ /^[0-9]+$/ ? $2 : 0); exit}' "$STATE" 2>/dev/null)
       [ "${fails:-0}" -gt 0 ] 2>/dev/null && warn "  $name 连续失败 ${fails} 次（看护在退避重试）"
     done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
+  elif [ $loaded -eq 1 ]; then
+    info "看护：已加载但还没跑完一轮"
   elif [ -f "$WATCH_PLIST" ]; then
-    info "看护：plist 已装但还没跑过（launchctl list | grep ${WATCH_LABEL}）"
+    info "看护：plist 在但没加载（launchctl bootstrap gui/$(id -u) ${WATCH_PLIST}）"
   else
     info "看护未启用：uulink watch --install（每分钟 banner 检测，断了自动修）"
   fi
@@ -414,7 +417,7 @@ watch_state() { # $1=名称 → 输出 fails<TAB>last_attempt（两列都强制�
     END {
       if (a !~ /^[0-9]+$/) a=0
       if (b !~ /^[0-9]+$/) b=0
-      printf "%s\t%s", a, b
+      printf "%s\t%s\n", a, b
     }' "$STATE"
 }
 
@@ -433,12 +436,17 @@ lock_alive() { # 锁目录里的 pid 是否还是个活进程
   ps -p "$p" >/dev/null 2>&1
 }
 
+WERR="$HOME/.config/uulink/watch.err"
+
 wlog() {
   mkdir -p "$(dirname "$WLOG")"
-  # 200KB 轮转一份，别让它无限长
-  if [ -f "$WLOG" ] && [ "$(wc -c <"$WLOG" 2>/dev/null || echo 0)" -gt 204800 ]; then
-    mv -f "$WLOG" "$WLOG.1"
-  fi
+  # 200KB 轮转一份，别让它无限长；stderr 由 launchd 直写，同样要管
+  local f
+  for f in "$WLOG" "$WERR"; do
+    if [ -f "$f" ] && [ "$(wc -c <"$f" 2>/dev/null || echo 0)" -gt 204800 ]; then
+      mv -f "$f" "$f.1"
+    fi
+  done
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$WLOG" 2>/dev/null || true
 }
 
@@ -447,7 +455,7 @@ kick_tunnels() { # $1=设备名：把依赖这条通路的常驻隧道重启（�
   [ -f "$TUNNELS" ] || return 0
   while IFS=$'\t' read -r n lab; do
     case "${n:-}" in ''|\#*) continue;; esac
-    [ "$n" = "$1" ] || continue
+    [ "$(printf '%s' "$n" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" ] || continue
     [ -n "${lab:-}" ] || continue
     if launchctl kickstart -k "gui/$(id -u)/$lab" >/dev/null 2>&1; then
       wlog "  kickstart $lab"
@@ -476,6 +484,7 @@ try_open() { # $1=设备名 $2=端口 $3=id → 0=已通
 
 cmd_watch() {
   local once=0 quiet=0 install=0 uninstall=0 a
+  local name _ port id fails last gap devlist now rc
   for a in "$@"; do
     case "$a" in
       --once) once=1 ;;
@@ -508,10 +517,10 @@ cmd_watch() {
     mkdir "$LOCK" 2>/dev/null || return 0
   fi
   echo $$ >"$LOCK/pid"
-  trap 'rm -rf "$LOCK"' EXIT
+  trap 'rm -rf "$LOCK"' EXIT INT TERM
 
   while :; do
-    local name _ port _ _ now fails last gap devlist id rc=0
+    rc=0
     now=$(date +%s)
     devlist=$(list_devices 2>/dev/null)   # 每轮只取一次，别在循环里反复调 CLI
 
@@ -533,8 +542,8 @@ cmd_watch() {
 
       read -r fails last < <(watch_state "$name")
       fails=$(( ${fails:-0} + 1 ))
-      # 退避：断网是常态，别每分钟硬撞；连续失败 3 次后间隔拉到 15 分钟
-      gap=120; [ "$fails" -ge 3 ] && gap=900
+      # 退避：前 3 次照常每轮都试（和文档一致），之后拉长到 15 分钟，断网时不空撞
+      gap=0; [ "$fails" -ge 3 ] && gap=900
       if [ "${last:-0}" -gt 0 ] && [ $(( now - last )) -lt "$gap" ]; then
         # 记下失败轮数，但不动 last —— last 是"上次真正尝试"的时刻，退避基准不能漂
         watch_put "$name" "$fails" "$last"
@@ -563,16 +572,20 @@ cmd_watch() {
         wlog "$name :$port 不通，且 uu device list 无输出（CLI 异常）→ 仍尝试自愈"
       fi
 
-      [ $quiet -eq 0 ] && warn "$name :$port 不通（连续 $fails 次），开始自愈"
-      wlog "$name :$port 不通（连续 $fails 次），开始自愈"
-      kick_tunnels "$name"
-      id=$(printf '%s\n' "$devlist" | awk -F'\t' -v w="$name" 'tolower($1)==tolower(w){print $2; exit}')
+      # 先拿 id 再动手：拿不到就别踢隧道（否则隧道被重启、自愈却根本没执行）
+      id=$(printf '%s\n' "${devlist:-}" | awk -F'\t' -v w="$name" 'tolower($1)==tolower(w){print $2; exit}')
       if [ -z "${id:-}" ]; then
-        wlog "  UU 设备列表里找不到「${name}」，跳过"
-        watch_put "$name" "$fails" "$now"
+        wlog "$name :$port 不通，但解析不出设备 id（uu device list 取不到）→ 本轮不动手"
+        [ $quiet -eq 0 ] && warn "$name 拿不到设备 id，先不动隧道"
+        watch_put "$name" "$fails" "$last"
         continue
       fi
+      [ $quiet -eq 0 ] && warn "$name :$port 不通（连续 $fails 次），开始自愈"
+      wlog "$name :$port 不通（连续 $fails 次），开始自愈"
       if try_open "$name" "$port" "$id"; then
+        # 顺序很重要：通路确认活了再踢旧隧道。反过来踢，新连会打在还没恢复的端口上，
+        # 白耗一轮 launchd 重启配额（甚至触发 crash-throttle）。
+        kick_tunnels "$name"
         wlog "  自愈成功"
         [ $quiet -eq 0 ] && ok "$name :$port 自愈成功"
         watch_put "$name" 0 0
@@ -612,6 +625,10 @@ watch_install() {
   </array>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>StandardErrorPath</key><string>$HOME/.config/uulink/watch.err</string>
 </dict>
 </plist>

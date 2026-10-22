@@ -55,6 +55,8 @@ if "$BIN_DIR/uulink" check; then
   say "    uulink watch --install"
   say "  不装的话，链路断掉时 ssh 进程不会退出，launchd 的 KeepAlive 也就不会触发，"
   say "  隧道会「看起来在线」但实际上整条是死的（详见 references/traps.md §8）。"
+  say "  装完记得登记依赖：~/.config/uulink/tunnels.tsv（设备名<TAB>launchd 标签），"
+  say "  否则看护只会修通路、不会重启你的隧道。"
 else
   warn "自检没跑完，先确认 UU 已登录"
 fi
