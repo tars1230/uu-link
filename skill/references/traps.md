@@ -187,3 +187,25 @@ $ nc -d -G 6 127.0.0.1 2222 | head -c 40            # SSH-2.0-OpenSSH_for_Window
 
 - **必须用 ssh 别名**（`scp file office-pc:`）。直接写 `-p 2222 user@127.0.0.1` 会 `Permission denied (publickey)`——密钥绑在别名的 `IdentityFile` 上，裸 IP 那条没有 identity。
 - **scp 挂死不一定是通道问题**：本轮最初两次"scp 卡住"都是对端掉线造成的，链路恢复后同一命令 1 秒内完成。先读 banner 再怀疑 scp。
+
+### 8.4 测试看护时，mock 必须走 `UU_LINK_CLI`，塞 PATH 无效
+
+`uulink` 里的 `uu` 是**脚本内函数**，直接 `"$PY" - "$UUCLI" "$@"`，根本不查 PATH：
+
+```bash
+uu() { "$PY" - "$UUCLI" "$@" <<'PY' ... }   # $UUCLI 由 $UU_LINK_CLI 或固定路径决定
+```
+
+所以 `PATH=/tmp/mock:$PATH uulink watch --once` 这一招**拦不住**，会真的调 `uuyc-cli`。
+本轮实测代价：一次"隔离"测试跑了 5 轮，真的对 UU 客户端发了约 15 次 `term open`（日志里 id 是真实设备 id，不是 mock 的 `id-tars`），并在客户端留下会话窗口。
+
+正确做法：
+
+```bash
+UU_LINK_CLI=/tmp/mockcli HOME=/tmp/sandbox uulink watch --once
+```
+
+**识别征兆**：日志里出现 `term open 成功` 而你明明让 mock 返回 `success:false`
+⇒ 说明 mock 没生效，正在打真实 CLI。立刻停下，去 UU 客户端清会话。
+
+回归脚本 `regress-watch.sh` 已按这个约定写好（7 组用例、18 项断言），改完看护先跑它。

@@ -234,18 +234,29 @@ print("  版本 %s  登录 %s  网络 %s" % (d.get("appVersion"), d.get("isLogge
     fi
   done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
   [ $found -eq 1 ] || info "还没配设备：编辑 ${CFG}（模板里有格式），或先 uulink list 看设备名"
-  local lr fails loaded=0
+  local lr fails loaded=0 age=0 lst=""
   launchctl list "$WATCH_LABEL" >/dev/null 2>&1 && loaded=1
+  if [ $loaded -eq 1 ]; then
+    # 上轮的退出码。看护本身崩了（比如变量未定义）时 loaded 仍然是 1，
+    # 只查 loaded 会让人以为"装好了在跑"，实际每轮都在退出
+    lst=$(launchctl list "$WATCH_LABEL" 2>/dev/null | sed -n 's/.*"LastExitStatus" *= *\([0-9-]*\).*/\1/p' | head -1)
+  fi
   lr=$(cat "$LASTF" 2>/dev/null)
   if [ $loaded -eq 1 ] && [ -n "${lr:-}" ]; then
-    info "看护：上次运行 $(date -r "$lr" '+%m-%d %H:%M:%S' 2>/dev/null || echo "$lr")（日志 ${WLOG}）"
+    age=$(( $(date +%s) - lr ))
+    info "看护：上次运行 $(date -r "$lr" '+%m-%d %H:%M:%S' 2>/dev/null || echo "$lr")（${age}s 前，日志 ${WLOG}）"
+    # 定时器 60s 一轮：超过 5 轮没更新 = 停摆了，而 launchctl 仍说"已加载"
+    [ "$age" -gt 300 ] && warn "看护：已 ${age}s 没运行（超过 5 个周期），疑似停摆 → launchctl kickstart -k gui/$(id -u)/${WATCH_LABEL}"
+    if [ -n "${lst:-}" ] && [ "${lst}" != "0" ]; then
+      warn "看护：上轮退出码 ${lst}（非 0）→ 看 ${WERR}"
+    fi
     while IFS=$'\t' read -r name _ port _ _; do
       case "${name:-}" in ''|\#*) continue;; esac
       fails=$(awk -F'\t' -v n="$name" '$1==n{print ($2 ~ /^[0-9]+$/ ? $2 : 0); exit}' "$STATE" 2>/dev/null)
-      [ "${fails:-0}" -gt 0 ] 2>/dev/null && warn "  $name 连续失败 ${fails} 次（看护在退避重试）"
+      [ "${fails:-0}" -gt 0 ] 2>/dev/null && warn "  $name 已尝试补救 ${fails} 次仍失败（看护在退避重试）"
     done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
   elif [ $loaded -eq 1 ]; then
-    info "看护：已加载但还没跑完一轮"
+    info "看护：已加载但还没跑完一轮（等 60s 再看）"
   elif [ -f "$WATCH_PLIST" ]; then
     info "看护：plist 在但没加载（launchctl bootstrap gui/$(id -u) ${WATCH_PLIST}）"
   else
@@ -404,6 +415,7 @@ cmd_ssh() {
 # 实测：反向隧道曾这样"假装活着"空转 20 分钟，同时在对端留下幽灵监听。
 STATE="$HOME/.config/uulink/watch.state"    # 每行：名称<TAB>连续失败数<TAB>上次尝试epoch
 WLOG="$HOME/.config/uulink/watch.log"       # 人读的流水账
+WERR="$HOME/.config/uulink/watch.err"       # launchd 的 stderr 落点，wlog 轮转它时要读
 TUNNELS="$HOME/.config/uulink/tunnels.tsv"  # 每行：设备名<TAB>launchd标签
 LOCKD="$HOME/.config/uulink/watch.lock"      # 目录锁（mkdir 原子），见 acquire_lock
 LASTF="$HOME/.config/uulink/watch.last"      # 最近一次运行时刻；单独存，避免和设备名撞键
@@ -433,8 +445,10 @@ watch_put() { # $1=名称 $2=fails $3=last_attempt
 # 关键取舍：**判据只看目录年龄，不判进程活没活**。
 #   · 不判 pid 存活 → 彻底没有 PID 被复用后"锁永远被占、看护静默停摆"这个失效模式
 #   · 代价是崩溃留下的锁要等 LOCK_STALE 才回收（由定时器兜底，可接受）
-#   · 目录里的 pid 文件只给人看，任何决策都不读它
+#   · owner 文件只用来回答"这把锁是不是我建的"，不参与"该不该抢"的决策
+#   · 长跑实例必须 lock_touch 续命，否则真活着的会被当陈旧锁回收
 LOCK_STALE=600    # 秒。一轮最长约 90s，留足余量
+LOCKTOK=""        # 本实例的锁令牌，acquire_lock 成功后才有值
 
 lock_age() {
   local m
@@ -442,36 +456,69 @@ lock_age() {
   printf '%s' $(( $(date +%s) - m ))
 }
 
+# 抢到锁后写入本实例令牌。令牌必须唯一到"同一 pid 不同时刻"也能区分，
+# 光用 $$ 会在 PID 复用时误判成"还是我的"。
+lock_take() {
+  LOCKTOK="$$.$(date +%s).${RANDOM:-0}"
+  [ -d "$LOCKD" ] || return 1
+  printf '%s\n' "$LOCKTOK" >"$LOCKD/owner" 2>/dev/null || true
+  printf '%s\n' "$$" >"$LOCKD/pid" 2>/dev/null || true
+  return 0
+}
+
+# mkdir 失败有两种含义，必须分开：目录已存在 = 别人在跑（正常跳过）；
+# 其它（权限、只读盘、ENOSPC）= 真故障，静默 return 会让看护永久停摆且无痕迹。
+lock_busy_or_broken() {
+  [ -d "$LOCKD" ] && return 0      # 真的是别人占着
+  wlog "取锁失败，且锁目录不存在（权限/磁盘问题？）→ 本轮跳过"
+  return 1
+}
+
 acquire_lock() {
   if mkdir "$LOCKD" 2>/dev/null; then
-    printf '%s\n' $$ >"$LOCKD/pid"
+    lock_take
     return 0
   fi
   local age
   if ! age=$(lock_age); then          # 目录刚消失（上一轮恰好结束），直接重抢
-    mkdir "$LOCKD" 2>/dev/null || return 1
-    printf '%s\n' $$ >"$LOCKD/pid"
+    mkdir "$LOCKD" 2>/dev/null || { lock_busy_or_broken; return 1; }
+    lock_take
     return 0
   fi
   [ "$age" -gt "$LOCK_STALE" ] || return 1    # 还新鲜，当别人在用
-  # 回收陈旧锁。mv 走之后再核一次年龄：万一搬到的其实是别人刚建的新锁，
-  # 年龄对不上就原样放回去（这一步把"两个回收者互删"的窗口也堵了）
+
+  # 回收陈旧锁：先原子搬走再核年龄。若搬到一半发现它其实是别人刚建的新锁（年龄不符），
+  # 必须原样放回；但**放回前要确认 LOCKD 还没被别人重新建好**，
+  # 否则 mv 会把 aside 整个塞进 LOCKD/aside 变成垃圾目录（老版本的 bug）。
   local aside="$LOCKD.stale.$$" m2
+  rm -rf "$aside" 2>/dev/null
   mv "$LOCKD" "$aside" 2>/dev/null || return 1
   m2=$(stat -f %m "$aside" 2>/dev/null || echo "$(date +%s)")
-  if [ $(( $(date +%s) - m2 )) -gt "$LOCK_STALE" ]; then
-    rm -rf "$aside"
-  else
-    mv "$aside" "$LOCKD" 2>/dev/null
+  if [ $(( $(date +%s) - m2 )) -le "$LOCK_STALE" ]; then
+    if [ -e "$LOCKD" ]; then
+      rm -rf "$aside"
+    else
+      mv "$aside" "$LOCKD" 2>/dev/null || rm -rf "$aside"
+    fi
     return 1
   fi
-  mkdir "$LOCKD" 2>/dev/null || return 1
-  printf '%s\n' $$ >"$LOCKD/pid"
+  rm -rf "$aside"
+  mkdir "$LOCKD" 2>/dev/null || { lock_busy_or_broken; return 1; }
+  lock_take
   return 0
 }
 
-# 动真格之前确认锁还是自己的（内容比对），防止极端并发下两轮同时自愈
-lock_still_mine() { [ "$(cat "$LOCKD/pid" 2>/dev/null)" = "$$" ]; }
+# 这把锁是不是我建的（令牌比对，不是为了"该不该抢"做决策）
+lock_is_mine() {
+  [ -n "${LOCKTOK:-}" ] || return 1
+  [ "$(cat "$LOCKD/owner" 2>/dev/null)" = "$LOCKTOK" ]
+}
+
+# 长跑实例续命：不刷新 mtime，跑过 LOCK_STALE 就会被下一轮当陈旧锁回收
+lock_touch() { [ -d "$LOCKD" ] && touch "$LOCKD" 2>/dev/null; return 0; }
+
+# 动真格之前确认锁还是自己的，防止极端并发下两轮同时自愈
+lock_still_mine() { lock_is_mine; }
 
 wlog() {
   mkdir -p "$(dirname "$WLOG")"
@@ -541,13 +588,16 @@ cmd_watch() {
     return 0
   fi
   # 信号只负责"退出"，清理交给 EXIT：否则 INT/TERM 后进程会带着失效的锁继续跑
-  trap 'rm -rf "$LOCKD"' EXIT
+  # EXIT 里必须先验令牌：老版本无条件 rm -rf，会把**抢到锁的下一轮**的锁删掉，
+  # 于是第三个实例立刻并发进场（这就是"锁被自己人砸开"）
+  trap 'if lock_is_mine; then rm -rf "$LOCKD"; fi' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
   while :; do
     rc=0
     now=$(date +%s)
+    lock_touch                    # 续命：常驻实例跑过 LOCK_STALE 也不会被当陈旧锁回收
     devlist=$(list_devices 2>/dev/null)   # 每轮只取一次，别在循环里反复调 CLI
 
     while IFS=$'\t' read -r name _ port _ _; do
@@ -557,8 +607,12 @@ cmd_watch() {
       if chan_ok "$port"; then
         read -r fails last < <(watch_state "$name")
         if [ "${fails:-0}" -gt 0 ] 2>/dev/null; then
-          wlog "$name :$port 恢复（此前连续失败 $fails 次）"
-          [ $quiet -eq 0 ] && ok "$name :$port 恢复"
+          wlog "$name :$port 通路恢复（此前连续失败 ${fails} 次）"
+          [ $quiet -eq 0 ] && ok "$name :$port 通路恢复"
+          # 通路是它自己好的（不是我们 try_open 出来的）⇒ 旧 ssh 仍挂在死 socket 上。
+          # 这种进程不报错、不退、KeepAlive 不触发，光"通路通了"并不会让它重连，
+          # 必须趁这一轮踢一次。稳态（fails==0）绝不踢，否则每轮都在踢死好隧道。
+          kick_tunnels "$name"
         fi
         # 成功时把 last_attempt 一起清零：退避只该由"补救过但没成功"来触发，
         # 否则刚恢复时又会因为"上次成功很近"把下一次真实断线的首修推迟一整个退避窗
@@ -566,14 +620,27 @@ cmd_watch() {
         continue
       fi
 
+      # 破坏性动作（term open + 踢隧道）不能建在一次 6s 采样上：UU 偶发抖动就误踢，
+      # 反而把本来好好的隧道踢成断线。隔 2s 再采一次，两次都失败才认定真断。
+      sleep 2
+      if chan_ok "$port"; then
+        wlog "$name :$port 首采失败、复采正常（抖动）→ 本轮不动手"
+        continue                      # 不写状态：抖动不计入连续失败
+      fi
+
       read -r fails last < <(watch_state "$name")
-      fails=$(( ${fails:-0} + 1 ))
-      # 退避：前 3 次照常每轮都试（和文档一致），之后拉长到 15 分钟，断网时不空撞
+      fails=${fails:-0}
+      # 退避判据用"已动手且失败"的次数：fails 只在真正 try_open 之后才 +1。
+      # 老版本在这里先 +1 再比 -ge 3，等于把"待尝试"的那次也算进去，实际只试 2 次；
+      # 而且离线/名字写错的分支也跟着 +1，设备回网后要白等一整个 15 分钟退避窗。
       gap=0; [ "$fails" -ge 3 ] && gap=900
       if [ "${last:-0}" -gt 0 ] && [ $(( now - last )) -lt "$gap" ]; then
-        # 记下失败轮数，但不动 last —— last 是"上次真正尝试"的时刻，退避基准不能漂
+        # 不动 last —— 它是"上次真正尝试"的时刻，退避基准不能漂
         watch_put "$name" "$fails" "$last"
-        [ $quiet -eq 0 ] && info "$name :$port 仍不通（连续 $fails 次），退避中"
+        [ $quiet -eq 0 ] && info "$name :$port 仍不通（已尝试补救 $fails 次），退避中"
+        # 只在刚跨过阈值那一次落日志：断网整夜时日志里必须留一条"它在退避"，
+        # 否则 launchd 把 stdout 丢掉，运维看到的是一片空白，会误判成看护没在跑
+        [ "$fails" -eq 3 ] && wlog "$name :$port 连续 $fails 次补救失败，转入 15 分钟退避"
         continue
       fi
 
@@ -583,13 +650,15 @@ cmd_watch() {
         if ! printf '%s\n' "$devlist" | awk -F'\t' -v n="$name" 'tolower($1)==tolower(n){f=1}END{exit !f}'; then
           wlog "$name :$port 不通，且 UU 设备列表里查无此设备（名字写错？）→ 跳过"
           [ $quiet -eq 0 ] && warn "$name 不在 UU 设备列表里，检查 devices.tsv 的名字"
-          # 没真正尝试过，别写 last：设备一旦回来应当立刻重试，而不是等退避窗走完
+          # 没真正尝试过：既不加 fails（否则名字写错几十轮后会触发退避），
+          # 也不写 last（设备一旦回来应当立刻重试，而不是等退避窗走完）
           watch_put "$name" "$fails" "$last"
           continue
         fi
         if ! printf '%s\n' "$devlist" | awk -F'\t' -v n="$name" 'tolower($1)==tolower(n)&&$3=="1"{f=1}END{exit !f}'; then
           wlog "$name :$port 不通，且该设备在 UU 里显示离线 → 不尝试自愈"
           [ $quiet -eq 0 ] && warn "$name 设备离线，等它回来"
+          # 离线不是"补救失败"，不计入 fails：设备回网后应立刻首修，不排队等退避
           watch_put "$name" "$fails" "$last"
           continue
         fi
@@ -613,8 +682,10 @@ cmd_watch() {
         watch_put "$name" "$fails" "$last"
         continue
       fi
-      [ $quiet -eq 0 ] && warn "$name :$port 不通（连续 $fails 次），开始自愈"
-      wlog "$name :$port 不通（连续 $fails 次），开始自愈"
+      # 到这里才真是"要动手了"：此时才 +1，失败计数只反映真实的补救尝试
+      fails=$(( fails + 1 ))
+      [ $quiet -eq 0 ] && warn "$name :$port 不通（第 $fails 次补救），开始自愈"
+      wlog "$name :$port 不通（第 $fails 次补救），开始自愈"
       if try_open "$name" "$port" "$id"; then
         # 顺序很重要：通路确认活了再踢旧隧道。反过来踢，新连会打在还没恢复的端口上，
         # 白耗一轮 launchd 重启配额（甚至触发 crash-throttle）。
@@ -663,7 +734,7 @@ watch_install() {
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
-  <key>StandardErrorPath</key><string>$HOME/.config/uulink/watch.err</string>
+  <key>StandardErrorPath</key><string>$WERR</string>
 </dict>
 </plist>
 EOF

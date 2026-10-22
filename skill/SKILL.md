@@ -3,7 +3,7 @@ name: uu-link
 description: 通过网易 UU 远程自带的端口映射，建立到任意一台 UU 账号设备的 SSH 通路，含自动建会话、通路健康判定与排障。This skill should be used when the user asks to 连接/操控另一台电脑、建跨机通道、去另一台机器取文件或跑命令，或提到 uulink、UU 端口映射、办公室电脑、家里的电脑。
 description_zh: "用 UU 远程端口映射一键建立跨机 SSH 通路；用户提到 uulink、UU 端口映射、连办公室/家里的电脑时使用"
 description_en: "One-command SSH channel to any device on your UU Remote account; use when asked to reach another machine via UU port mapping"
-version: 1.0.6
+version: 1.0.7
 agent_created: true
 allowed-tools: Bash,Read
 metadata:
