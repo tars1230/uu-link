@@ -1,0 +1,385 @@
+#!/bin/bash
+# uulink — 用 UU 远程的端口映射，一键建立到某台设备的 SSH 通路
+#
+# 背景（都是实测出来的，别再踩）：
+#   · 映射规则只能在 UU 图形界面里加（CLI 没有这个命令）
+#   · 本地监听只在「有会话」时存在
+#   · 【坑】`device disconnect` 会把端口变成"幽灵监听"：TCP 还能连上，
+#          后端已经死了，SSH 卡在 banner。这个幽灵从命令行清不掉，
+#          只能等新会话顶上去，或重启 UU（重启后还要手动把映射开关重置一次）
+#   · 【因此】判断"通不通"绝不能只看 TCP 能连，必须读到 SSH banner
+#   · 关掉终端窗口不影响映射（映射挂在会话上，不挂在窗口上）
+#
+# 用法：
+#   uulink                 体检（只读）
+#   uulink check [名称]    体检；带名称只查那一条
+#   uulink list            列出 UU 账号里的设备与在线状态
+#   uulink up [名称]       确保通路（必要时 term open 建轻会话）
+#   uulink ssh [名称] [命令...]   直连；不带命令进交互 shell
+#   uulink down            解释为什么"关掉单向连接"不该做
+#   uulink down [名称] --force [-y]   重启 UU 清掉幽灵端口（会断所有远控）
+#
+set -uo pipefail
+
+# UU 客户端 CLI：优先环境变量，其次脚本同级目录，最后 macOS 应用包内
+UUCLI="${UU_LINK_CLI:-}"
+if [ -z "$UUCLI" ]; then
+  _self_dir="$(cd "$(dirname "$0")" && pwd)"
+  if [ -x "$_self_dir/uuyc-cli" ]; then
+    UUCLI="$_self_dir/uuyc-cli"
+  else
+    UUCLI="/Applications/UURemote.app/Contents/Helpers/uuyc-cli"
+  fi
+fi
+CFG="$HOME/.config/uulink/devices.tsv"
+KH="$HOME/.config/uulink/known_hosts"
+PY="$(command -v python3 || echo /usr/bin/python3)"
+
+die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+ok()  { printf '\033[32m✓ %s\033[0m\n' "$*"; }
+warn(){ printf '\033[33m! %s\033[0m\n' "$*"; }
+info(){ printf '  %s\n' "$*"; }
+
+[ -x "$UUCLI" ] || die "找不到 uuyc-cli：$UUCLI（可用 UU_LINK_CLI 指定路径）"
+
+# 所有 CLI 调用都带 20s 超时——UU 客户端偶发不返回时，不能把整个 up 挂死
+uu() {
+  "$PY" - "$UUCLI" "$@" <<'PY' 2>&1
+import subprocess, sys
+try:
+    r = subprocess.run(sys.argv[1:], capture_output=True, text=True, timeout=20)
+except subprocess.TimeoutExpired:
+    print("uuyc-cli 超时(20s)", file=sys.stderr)
+    sys.exit(124)
+sys.stdout.write(r.stdout)
+sys.stderr.write(r.stderr)
+sys.exit(r.returncode)
+PY
+}
+
+# 只保留 JSON 里的 success / error.message，避免把整包响应（可能含设备信息）打出来
+uu_msg() { printf '%s' "$1" | "$PY" -c '
+import json,sys
+raw=sys.stdin.read()
+try: o=json.loads(raw)
+except Exception: print(raw.strip()[:200]); raise SystemExit
+d=o.get("data") or {}; e=o.get("error") or {}
+print(d.get("message") or e.get("message") or ("success" if o.get("success") else "失败"))'; }
+
+# ---------- 配置 ----------
+ensure_cfg() {
+  local d; d="$(dirname "$CFG")"
+  mkdir -p "$d"
+  chmod 700 "$d" 2>/dev/null
+  [ -f "$CFG" ] && { chmod 600 "$CFG" 2>/dev/null; return; }
+  cat > "$CFG" <<'EOF'
+# name	deviceId	localport	sshuser	key
+# deviceId 写 - 表示每次从 device list 按名称自动取
+# 多台设备请用不同 localport，避免抢端口
+# 下面这行是模板，改成你自己的设备后去掉行首的 #
+# office-pc	-	2222	administrator	~/.ssh/id_ed25519
+EOF
+  chmod 600 "$CFG" 2>/dev/null
+}
+
+list_devices() {
+  uu device list | "$PY" -c '
+import json,sys
+try: d=json.load(sys.stdin)["data"]["devices"]
+except Exception: sys.exit(1)
+for x in d:
+    print("%s\t%s\t%s" % (x.get("deviceName",""), x.get("deviceId",""),
+                          "1" if x.get("isOnline") else "0"))
+'
+}
+
+resolve_id() {
+  local id
+  id=$(list_devices | awk -F'\t' -v w="$1" 'tolower($1)==tolower(w){print $2; exit}')
+  [ -n "$id" ] || return 1
+  printf '%s' "$id"
+}
+
+cfg_field() { # $1=名称 $2=列号；找不到返回非 0
+  [ -f "$CFG" ] || return 1
+  local v
+  v=$(awk -F'\t' -v w="$1" -v c="$2" '
+    /^[[:space:]]*#/ {next} NF>=5 && tolower($1)==tolower(w) {print $c; exit}' "$CFG")
+  [ -n "$v" ] || return 1
+  printf '%s' "$v"
+}
+
+configured_online() {
+  local n _ on
+  while IFS=$'\t' read -r n _ on; do
+    [ "$on" = "1" ] || continue
+    cfg_field "$n" 3 >/dev/null 2>&1 && printf '%s\n' "$n"
+  done < <(list_devices)
+}
+
+# 未指定设备时：唯一候选才自动选，多个候选必须点名（避免静默操作错设备）
+pick_name() {
+  local list count
+  list=$(configured_online)
+  count=$(printf '%s\n' "$list" | grep -c . || true)
+  [ "$count" -ge 1 ] || return 1
+  if [ "$count" -gt 1 ]; then
+    printf '\033[33m! 有 %s 台设备可用，请点名：\033[0m\n' "$count" >&2
+    printf '  %s\n' $list >&2
+    return 2
+  fi
+  printf '%s' "$list"
+}
+
+# ---------- 健康判定 ----------
+port_listening() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+# 只看监听会被幽灵骗，必须读到协议层 banner。
+# 注意：强绑定 SSH 协议；若映射目标不是 SSH 服务，会判为不通。
+chan_ok() {
+  "$PY" - "$1" <<'PY' 2>/dev/null
+import socket, sys
+port = int(sys.argv[1])
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=6)
+except Exception:
+    sys.exit(1)
+s.settimeout(6)
+try:
+    head = s.recv(64)
+except Exception:
+    sys.exit(1)
+finally:
+    try: s.close()
+    except Exception: pass
+sys.exit(0 if head.startswith(b"SSH-") else 1)
+PY
+}
+
+wait_chan() { # $1=port $2=墙钟超时秒（按真实时间，不按循环次数）
+  local p="$1" t="${2:-90}" deadline remaining
+  deadline=$(( $(date +%s) + t ))
+  while :; do
+    remaining=$(( deadline - $(date +%s) ))
+    [ $remaining -gt 0 ] || return 1
+    chan_ok "$p" && return 0
+    [ $remaining -gt 1 ] && sleep 1
+  done
+}
+
+# 只关 UU 自己的 sessionN 窗口（清理，不影响映射），不碰别的应用
+close_session_windows() {
+  osascript <<'OSA' 2>/dev/null
+tell application "System Events"
+  if not (exists process "UURemote") then return
+  tell process "UURemote"
+    repeat with w in (every window)
+      try
+        set nm to name of w
+        if nm is not missing value then
+          if nm starts with "session" and (length of nm) is less than 10 then
+            perform action "AXPress" of (first button of w whose subrole is "AXCloseButton")
+          end if
+        end if
+      end try
+    end repeat
+  end tell
+end tell
+OSA
+}
+
+# ---------- 动作 ----------
+cmd_list() {
+  local n id on mark tag p
+  printf '%-14s %-20s %s\n' "设备" "ID" "状态"
+  while IFS=$'\t' read -r n id on; do
+    [ -n "$n" ] || continue
+    mark="离线"; [ "$on" = "1" ] && mark=$'\033[32m在线\033[0m'
+    tag=""; p=$(cfg_field "$n" 3 2>/dev/null); [ -n "$p" ] && tag="  ← 已配通路 :$p"
+    printf '%-14s %-20s %b%s\n' "$n" "$id" "$mark" "$tag"
+  done < <(list_devices)
+}
+
+cmd_check() {
+  local only="${1:-}"
+  [ -n "$only" ] && { cfg_field "$only" 3 >/dev/null || die "${only} 不在 $CFG 里，先加一行"; }
+  echo "── UU ──"
+  uu status | "$PY" -c '
+import json,sys
+try: d=json.load(sys.stdin)["data"]
+except Exception: print("  无法解析 uuyc-cli status"); raise SystemExit
+print("  版本 %s  登录 %s  网络 %s" % (d.get("appVersion"), d.get("isLoggedIn"), d.get("networkStatus")))'
+  echo "── 设备 ──"; cmd_list
+  echo "── 通路 ──"
+  local name _ port found=0
+  while IFS=$'\t' read -r name _ port _ _; do
+    case "$name" in \#*|"") continue;; esac
+    [ -n "${port:-}" ] || continue
+    if [ -n "$only" ] && [ "$name" != "$only" ]; then continue; fi
+    found=1
+    if chan_ok "$port"; then
+      ok "$name  127.0.0.1:$port 真通"
+    elif port_listening "$port"; then
+      warn "$name  127.0.0.1:$port 幽灵监听（端口在、后端死）→ uulink up ${name}"
+    else
+      info "$name  127.0.0.1:$port 无监听 → uulink up ${name}"
+    fi
+  done < <(grep -v '^[[:space:]]*#' "$CFG" 2>/dev/null || true)
+  [ $found -eq 1 ] || info "还没配设备：编辑 $CFG（模板里有格式），或先 uulink list 看设备名"
+}
+
+cmd_up() {
+  local name="${1:-}" port id ghost=0 rc
+  if [ -z "$name" ]; then
+    name=$(pick_name); rc=$?
+    [ $rc -eq 2 ] && exit 2
+    [ $rc -eq 0 ] || die "没有在线且已配置的设备；先 uulink list 看状态"
+  fi
+  port=$(cfg_field "$name" 3) || die "${name} 不在 $CFG 里，先加一行"
+  id=$(resolve_id "$name") || die "UU 设备列表里找不到「${name}」"
+
+  if chan_ok "$port"; then
+    ok "$name 通路已在 127.0.0.1:$port"
+  else
+    port_listening "$port" && ghost=1
+    [ $ghost -eq 1 ] && warn "端口在监听但后端不通（幽灵），先试新会话顶替"
+    info "建立轻会话（term open，不拉整块桌面）"
+    local r; r=$(uu term open "$id")
+    if ! printf '%s' "$r" | grep -q '"success" *: *true'; then
+      warn "term open 失败：$(uu_msg "$r")"
+      die "会话没建起来（设备可能离线，先 uulink list）"
+    fi
+
+    info "等待通路就绪（最多 90s）…"
+    if wait_chan "$port" 90; then
+      ok "通路就绪"
+      close_session_windows
+    else
+      cat <<EOF
+$(printf '\033[33m! 会话开了但 90s 内没读到 SSH banner\033[0m')
+
+按概率排查：
+  1. 【最常见】UU 冷启动后规则显示"✓ 成功"但端口不绑 → 打开「端口映射」面板，
+     把那条开关关一次、再开一次，端口立刻回来（重启 UU 后必然要补这一步）
+  2. 规则不存在 → 同一面板「添加」：先选中目标设备，再填
+     本地 ${port} / 目标 127.0.0.1 / 目标端口 22
+  3. 幽灵端口卡死 → uulink down ${name} --force（重启 UU，之后仍要按第 1 条重绑）
+  4. 被控端 sshd 没跑
+EOF
+      exit 3
+    fi
+  fi
+  echo; ok "现在可以： uulink ssh ${name}"
+}
+
+cmd_down() {
+  local force=0 yes=0 name="" port="" id="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      -y|--yes) yes=1 ;;
+      *) name="$arg" ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    # --force 会断所有远控，绝不允许自动挑一台就执行
+    [ $force -eq 1 ] && die "--force 必须写清设备名（uulink down <名称> --force）"
+    name=$(pick_name); local rc=$?
+    [ $rc -eq 2 ] && exit 2
+    [ $rc -eq 0 ] || die "没指定设备"
+  fi
+  port=$(cfg_field "$name" 3 2>/dev/null) || port=""
+  id=$(resolve_id "$name") || die "UU 设备列表里找不到「${name}」"
+
+  if [ $force -eq 0 ]; then
+    cat <<EOF
+不要用"关掉单向连接"来避端口冲突——三条路都试过，全部无效：
+  · \`device disconnect\`：端口不退，而且会变成幽灵监听（后端死、TCP 仍可连）
+  · \`term exit\`：帮助原文"会话保留"
+  · 关窗口：不影响会话（映射挂在会话上）
+
+正确做法：给每台设备分配不同的 localport（${CFG}），
+多台可同时在线、互不干扰，根本不需要关。
+
+真要清掉 ${port}：uulink down ${name} --force
+EOF
+    return 0
+  fi
+
+  warn "这会强制退出 UU 客户端，切断本机所有正在进行的远控（包括别人正连着你这台）"
+  if [ $yes -eq 0 ]; then
+    if [ -t 0 ]; then
+      printf '  确认继续？[y/N] '
+      read -r ans
+      case "${ans:-}" in y|Y|yes|YES) ;; *) info "已取消"; return 1;; esac
+    else
+      # 非交互（脚本/agent）必须显式 -y，否则一律不执行
+      die "非交互环境不会自动确认，要执行请显式加 -y：uulink down ${name} --force -y"
+    fi
+  fi
+
+  info "退出 UU …"
+  osascript -e 'tell application id "com.netease.uuremote" to quit' 2>&1 | head -2
+  local i=0
+  while [ $i -lt 20 ]; do pgrep -x UURemote >/dev/null 2>&1 || break; sleep 0.5; i=$((i+1)); done
+  if pgrep -x UURemote >/dev/null 2>&1; then
+    warn "UU 没退出干净，再等 5 秒"
+    sleep 5
+    pgrep -x UURemote >/dev/null 2>&1 && die "UU 仍在运行，请手动退出后重试（端口未释放）"
+  fi
+
+  info "重新拉起 UU …"
+  if ! open -a UURemote; then
+    sleep 2
+    open -a UURemote || die "UU 现在处于关闭状态且拉不起来，请手动打开应用"
+  fi
+  i=0
+  while [ $i -lt 40 ]; do pgrep -x UURemote >/dev/null 2>&1 && break; sleep 0.5; i=$((i+1)); done
+  pgrep -x UURemote >/dev/null 2>&1 || die "UU 进程没回来，请手动打开应用"
+
+  i=0
+  while [ $i -lt 40 ]; do port_listening "$port" || break; sleep 0.5; i=$((i+1)); done
+  if port_listening "$port"; then
+    printf '  占用进程：%s\n' "$(lsof -nP -iTCP:"$port" -sTCP:LISTEN | tail -n +2 | awk '{print $1"("$2")"}' | paste -sd' ' -)"
+    warn "端口 ${port} 仍被占（UU 已重启，但监听还在）"
+  else
+    ok "端口 ${port} 已无监听（通路是否可用还需 uulink check 看真通）"
+  fi
+  warn "注意：UU 重启后映射规则会显示「✓ 成功」但端口不绑 —— 去端口映射面板把开关关一次再开一次"
+}
+
+cmd_ssh() {
+  local name="${1:-}" port user key rc
+  shift 2>/dev/null || true
+  if [ -z "$name" ]; then
+    name=$(pick_name); rc=$?
+    [ $rc -eq 2 ] && exit 2
+    [ $rc -eq 0 ] || die "没有可用设备"
+  fi
+  port=$(cfg_field "$name" 3); user=$(cfg_field "$name" 4); key=$(cfg_field "$name" 5)
+  [ -n "$port" ] || die "${name} 未配置"
+  chan_ok "$port" || { info "通路不通，先自动 up…"; cmd_up "$name" >/dev/null 2>&1 || die "up 失败，跑 uulink check 看细节"; }
+
+  mkdir -p "$(dirname "$KH")"; chmod 700 "$(dirname "$KH")" 2>/dev/null
+  [ -f "$KH" ] || : > "$KH"; chmod 600 "$KH" 2>/dev/null
+  # known_hosts 隔离：不同设备都走 127.0.0.1，共用全局文件会撞 host key
+  local sshargs=(-p "$port" -o IdentitiesOnly=yes
+                 -o StrictHostKeyChecking=accept-new
+                 -o "UserKnownHostsFile=$KH"
+                 -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3
+                 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%r@%h-%p" -o ControlPersist=15m)
+  [ -n "$key" ] && sshargs+=(-i "${key/#\~/$HOME}")
+  exec ssh "${sshargs[@]}" "$user@127.0.0.1" "$@"
+}
+
+# ---------- 入口 ----------
+ensure_cfg
+case "${1:-check}" in
+  list)  cmd_list ;;
+  check|status) cmd_check "${2:-}" ;;
+  up)    shift; cmd_up "$@" ;;
+  down)  shift; cmd_down "$@" ;;
+  ssh)   shift; cmd_ssh "$@" ;;
+  -h|--help|help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "未知子命令：$1（试试 uulink help）" ;;
+esac
