@@ -185,5 +185,5 @@ $ nc -d -G 6 127.0.0.1 2222 | head -c 40            # SSH-2.0-OpenSSH_for_Window
 
 两条附带结论：
 
-- **必须用 ssh 别名**（`scp file tars:`）。直接写 `-p 2222 user@127.0.0.1` 会 `Permission denied (publickey)`——密钥绑在别名的 `IdentityFile` 上，裸 IP 那条没有 identity。
+- **必须用 ssh 别名**（`scp file office-pc:`）。直接写 `-p 2222 user@127.0.0.1` 会 `Permission denied (publickey)`——密钥绑在别名的 `IdentityFile` 上，裸 IP 那条没有 identity。
 - **scp 挂死不一定是通道问题**：本轮最初两次"scp 卡住"都是对端掉线造成的，链路恢复后同一命令 1 秒内完成。先读 banner 再怀疑 scp。

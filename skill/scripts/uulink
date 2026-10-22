@@ -636,7 +636,7 @@ EOF
   if [ ! -f "$TUNNELS" ]; then
     cat >"$TUNNELS" <<'EOF'
 # 哪条通路挂了，就该重启哪些常驻隧道。格式：设备名<TAB>launchd 标签
-# 例：TARS	com.example.mac-reverse-tunnel
+# 例：office-pc	com.example.mac-reverse-tunnel
 EOF
   fi
   launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null
