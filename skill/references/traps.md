@@ -237,3 +237,23 @@ TARS :2224 不通（第 1 次补救），开始自愈
 检测 → 双采样 → 查设备在线 → 真实 `term open` 返回 success → banner 严格等满 45s → 判失败 → `fails+1`，全部覆盖。唯一不覆盖的是「端口最终绑上」那一步（取决于 UU 的映射机制，不是脚本逻辑）。改完记得改回。
 
 **顺手一个坑**：BSD `sed` 不支持 `\t`，`sed 's/^\(TARS\t-\)2222/\1222 4/'` 会静默不替换。改 tsv 用 python 按 `split("\t")` 处理。
+
+### 8.6 想「关掉 UU 看端口会不会自己回来」：三条路全被堵
+
+目的是回答一个日常问题：**UU 客户端重启后（开机、应用更新），端口会自己回来吗？**
+
+| 尝试 | 结果 |
+|---|---|
+| `uuyc-cli term exit <id>` | 端口仍 LISTEN，无效（见 §8.5） |
+| `uuyc-cli term close <id>` | 同上。**CLI 只提供 open，没有 close** |
+| `osascript -e 'tell application id "com.netease.uuremote" to quit'` | 返回 `execution error: 遇到一个错误：用户已取消。(-128)`，**UU 不退出** |
+
+`-128` 是 macOS 的 `errAEEventNotPermitted`/用户取消——自动化权限没给，Apple Event 被拒。**这不只是演练的障碍，它意味着 `uulink down --force` 在这台机器上根本走不完**：那条命令内部就是这句 osascript，失败后脚本会一路等到 `die "UU 仍在运行，请手动退出后重试"`。
+
+要重启 UU，只能人手动点菜单退出，或先在「系统设置 → 隐私与安全性 → 自动化」里给终端授权。
+
+**因此以下结论仍未验证**，不要在文档里写成肯定语气：
+- UU 重启后端口是否自动绑回
+- `uulink up`（`term open`）能否替用户完成"把关掉再打开"那一步
+
+已知的只有两件事：① 客户端不在时端口必然消失；② 20:43 那次真实 `term open` 确实返回 success 并建起了会话（但那次映射规则本来就是好的）。
